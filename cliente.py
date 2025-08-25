@@ -569,6 +569,12 @@ class TrayClient(QtWidgets.QSystemTrayIcon):
         self.message_received.connect(self._show_notification)
 
         self.show()
+        # --- buffer de notificaciones para agrupar ráfagas ---
+        self._notif_buf = []  # lista de tuplas (sender, text)
+        self._notif_timer = QtCore.QTimer()
+        self._notif_timer.setSingleShot(True)
+        self._notif_timer.timeout.connect(self._flush_notifications)
+        self._notif_cooldown_ms = 400  # ventana de agregación (ms): ajustá 400–1000
 
         # Hilo WebSocket
         self.ws_thread = threading.Thread(target=self._ws_thread_main, daemon=True)
@@ -732,8 +738,36 @@ class TrayClient(QtWidgets.QSystemTrayIcon):
 
         self.unread_count += 1
         self._update_tray_icon()
+    
+        # self.showMessage("🗲 Nuevo Mensaje", f"{sender}: {text}", self.icon(), self.settings.toast_ms)
+        self._notif_buf.append((sender, text))
+        # reinicia la ventana de agregación: mientras sigan llegando, no mostramos
+        self._notif_timer.start(self._notif_cooldown_ms)
+
+    def _flush_notifications(self):
+        if not self._notif_buf:
+            return
+
+        # armamos título y cuerpo
+        count = len(self._notif_buf)
+        if count == 1:
+            s, t = self._notif_buf[0]
+            title = "🗲 Nuevo Mensaje"
+            body  = f"{s}: {t}"
+        else:
+            title = f"🗲 {count} mensajes nuevos"
+            # mostramos hasta 3 líneas de preview
+            preview_lines = []
+            for s, t in self._notif_buf[:3]:
+                preview_lines.append(f"{s}: {t}")
+            if count > 3:
+                preview_lines.append(f"+ {count - 3} más…")
+            body = "\n".join(preview_lines)
+
+        self._notif_buf.clear()
         play_sound(resolve_asset(self.settings.sound_path, "sound.wav"), "sound.wav")
-        self.showMessage("🗲 Nuevo Mensaje", f"{sender}: {text}", self.icon(), self.settings.toast_ms)
+        self.showMessage(title, body, self.icon(), self.settings.toast_ms)
+
 
 
     def _on_message_clicked(self):
@@ -791,7 +825,7 @@ class TrayClient(QtWidgets.QSystemTrayIcon):
     # ---------- Configuración ----------
     def open_settings(self):
         if not prompt_password(self.settings.password, self.settings.admin_mode):
-            QtWidgets.QMessageBox.warning(None, "Acceso denegado", "Clave incorrecta.")
+            QtWidgets.QMessageBox.warning(None, "FastChat", "Clave incorrecta.")
             return
         
         dlg = SettingsDialog(Settings(), None)
