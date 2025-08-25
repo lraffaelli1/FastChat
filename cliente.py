@@ -100,7 +100,8 @@ class Settings:
         self.sound_recive = self.qs.value("sound_recive", resource_path("recive.wav"), str)
         self.icon_path  = self.qs.value("icon_path",  resource_path("icon.ico"), str)
         self.icon_unread = self.qs.value("icon_unread", resource_path("icon_unread.ico"), str)
-        self.toast_ms   = int(self.qs.value("toast_ms", 8000))
+        self.toast_ms   = int(self.qs.value("toast_ms", 5000))
+        self.password     = self.qs.value("password", "vna117sw.", str) 
 
     def save(self):
         self.qs.setValue("server_url", self.server_url)
@@ -111,7 +112,19 @@ class Settings:
         self.qs.setValue("icon_path",  self.icon_path)
         self.qs.setValue("icon_unread", self.icon_unread)
         self.qs.setValue("toast_ms",   self.toast_ms)
+        self.qs.setValue("password", self.password)
         self.qs.sync()
+
+def prompt_password(correct: str) -> bool:
+        if not correct:
+            return True
+        text, ok = QtWidgets.QInputDialog.getText(
+            None, "FastChat", "Clave de Administrador:",
+            QtWidgets.QLineEdit.EchoMode.Password
+        )
+        return ok and text == correct
+
+
 
 # ---------- Diálogo elegante de respuesta (ya mejorado) ----------
 class ReplyDialog(QtWidgets.QDialog):
@@ -416,25 +429,34 @@ class SettingsDialog(QtWidgets.QDialog):
         lay = QtWidgets.QVBoxLayout(self)
         lay.addWidget(tabs)
         lay.addLayout(btns)
-        self.resize(400, 200)
+        self.resize(400, 150)
+    
 
     def _general_tab(self):
         w = QtWidgets.QWidget()
         form = QtWidgets.QFormLayout()
         form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
 
-        # Server URL
         self.ed_url = QtWidgets.QLineEdit(self.settings.server_url)
         self.ed_url.setPlaceholderText("ws://192.168.0.10:8765")
-
-        # User name
+        self.ed_url.setToolTip("Dirección del servidor al que se conectará el cliente.")
         self.ed_user = QtWidgets.QLineEdit(self.settings.user_name)
+        self.toggleServer = QtWidgets.QCheckBox("Modo Host")
+        self.toggleServer.setToolTip("Si está activado, el cliente actuará como servidor con la ip asignada al equipo.")
+        self.toggleCliente = QtWidgets.QCheckBox("Administrador")
+        self.toggleCliente.setToolTip("Si está activado, el cliente tendrá acceso a todos los chats.")
 
-        form.addRow("Servidor (ws://…):", self.ed_url)
+        self.grid = QtWidgets.QGridLayout()
+        self.grid.addWidget(self.toggleCliente, 0, 0)
+        self.grid.addWidget(self.toggleServer, 0, 1)
+
+        form.addRow("", self.grid)
         form.addRow("Usuario:", self.ed_user)
+        form.addRow("Servidor:", self.ed_url)
 
         w.setLayout(form)
         return w
+
 
     def _on_save(self):
         url = self.ed_url.text().strip()
@@ -449,10 +471,13 @@ class SettingsDialog(QtWidgets.QDialog):
 
         self.settings.server_url = url
         self.settings.user_name = user
+        self.settings.password = self.ed_password.text().strip()
         self.settings.save()
 
         self.saved.emit(self.settings)
         self.accept()
+
+    
 
 
 # ---------- Cliente en bandeja ----------
@@ -578,21 +603,24 @@ class TrayClient(QtWidgets.QSystemTrayIcon):
         dlg.submitted.connect(send_and_append)
         dlg.exec()
 
+        
+
 
     # ---------- Configuración ----------
     def open_settings(self):
+        if not prompt_password(self.settings.password):
+            QtWidgets.QMessageBox.warning(None, "Acceso denegado", "Clave incorrecta.")
+            return
+        
         dlg = SettingsDialog(Settings(), None)
 
         def apply_and_refresh(st: Settings):
-            # Actualizamos paths y recargamos íconos
             self.settings = st
             self.icon_normal = QtGui.QIcon(self.settings.icon_path) if pathlib.Path(self.settings.icon_path).exists() \
                                else self.icon_normal
             self.icon_unread = QtGui.QIcon(self.settings.icon_unread) if pathlib.Path(self.settings.icon_unread).exists() \
                                else self.icon_normal
-            # Respetar estado actual de no leídos
             self._update_tray_icon()
-            # Forzar reconexión si cambió la URL
             asyncio.run_coroutine_threadsafe(self._force_reconnect(), self.loop)
 
         dlg.saved.connect(apply_and_refresh)
