@@ -1,7 +1,7 @@
 import sys, asyncio, threading, json, winsound, pathlib, os
 from PyQt6 import QtWidgets, QtGui, QtCore
-import websockets, base64, html, tempfile
-from io import BytesIO
+import websockets, base64, html, tempfile, datetime, logging
+from io import BytesIO; from collections import deque
 
 APP_ORG = "Tecnicos"
 APP_NAME = "FastChat"
@@ -102,6 +102,8 @@ class Settings:
         self.icon_unread = self.qs.value("icon_unread", resource_path("icon_unread.ico"), str)
         self.toast_ms   = int(self.qs.value("toast_ms", 5000))
         self.password     = self.qs.value("password", "vna117sw.", str) 
+        self.host_mode     = self.qs.value("host_mode", False, bool)
+        self.admin_mode    = self.qs.value("admin_mode", False, bool)
 
     def save(self):
         self.qs.setValue("server_url", self.server_url)
@@ -113,16 +115,21 @@ class Settings:
         self.qs.setValue("icon_unread", self.icon_unread)
         self.qs.setValue("toast_ms",   self.toast_ms)
         self.qs.setValue("password", self.password)
+        self.qs.setValue("host_mode", self.host_mode)
+        self.qs.setValue("admin_mode", self.admin_mode)
         self.qs.sync()
 
-def prompt_password(correct: str) -> bool:
-        if not correct:
-            return True
-        text, ok = QtWidgets.QInputDialog.getText(
-            None, "FastChat", "Clave de Administrador:",
-            QtWidgets.QLineEdit.EchoMode.Password
-        )
-        return ok and text == correct
+def prompt_password(correct: str, admin_mode: bool = False) -> bool:
+    if admin_mode:
+        return True
+    if not correct:
+        return True
+    text, ok = QtWidgets.QInputDialog.getText(
+        None, "FastChat", "Clave de Administrador:",
+        QtWidgets.QLineEdit.EchoMode.Password
+    )
+    return ok and text == correct
+
 
 
 
@@ -441,10 +448,14 @@ class SettingsDialog(QtWidgets.QDialog):
         self.ed_url.setPlaceholderText("ws://192.168.0.10:8765")
         self.ed_url.setToolTip("Dirección del servidor al que se conectará el cliente.")
         self.ed_user = QtWidgets.QLineEdit(self.settings.user_name)
+
         self.toggleServer = QtWidgets.QCheckBox("Modo Host")
         self.toggleServer.setToolTip("Si está activado, el cliente actuará como servidor con la ip asignada al equipo.")
+        self.toggleServer.setChecked(self.settings.host_mode)
+
         self.toggleCliente = QtWidgets.QCheckBox("Administrador")
         self.toggleCliente.setToolTip("Si está activado, el cliente tendrá acceso a todos los chats.")
+        self.toggleCliente.setChecked(self.settings.admin_mode)
 
         self.grid = QtWidgets.QGridLayout()
         self.grid.addWidget(self.toggleCliente, 0, 0)
@@ -471,7 +482,8 @@ class SettingsDialog(QtWidgets.QDialog):
 
         self.settings.server_url = url
         self.settings.user_name = user
-        self.settings.password = self.ed_password.text().strip()
+        self.settings.host_mode = self.toggleServer.isChecked()
+        self.settings.admin_mode = self.toggleCliente.isChecked()
         self.settings.save()
 
         self.saved.emit(self.settings)
@@ -523,6 +535,139 @@ class TrayClient(QtWidgets.QSystemTrayIcon):
         # Hilo WebSocket
         self.ws_thread = threading.Thread(target=self._ws_thread_main, daemon=True)
         self.ws_thread.start()
+        self._host_running = False
+        self._host_running = False
+        self._host_clients = set()
+        self._host_history = deque(maxlen=30)
+        self._host_history_path = pathlib.Path(tempfile.gettempdir()) / "fastchat.json"
+
+        # aplicar modo host luego de que el loop esté vivo
+        QtCore.QTimer.singleShot(300, self._apply_host_mode_from_settings)
+
+    def _apply_host_mode_from_settings(self):
+        # sincronizamos en el loop asyncio
+        asyncio.run_coroutine_threadsafe(self._host_apply_from_settings(), self.loop)
+    
+    async def _host_apply_from_settings(self):
+        if self.settings.host_mode and not self._host_running:
+            await self._host_start()
+            # si activamos host, conectamos el cliente a localhost
+            if not self.settings.server_url.startswith("ws://127.0.0.1"):
+                self.settings.server_url = "ws://127.0.0.1:8765"
+                self.settings.save()
+                await self._force_reconnect()
+        elif not self.settings.host_mode and self._host_running:
+            await self._host_stop()
+
+    async def _host_start(self, host="0.0.0.0", port=8765):
+        if self._host_running:
+            return
+        # cargar historial desde disco (si existe)
+        try:
+            if self._host_history_path.exists():
+                items = json.loads(self._host_history_path.read_text(encoding="utf-8"))
+                for it in items[-30:]:
+                    self._host_history.append(it)
+                print(f"[Host] Historial cargado ({len(self._host_history)} mensajes)")
+        except Exception as e:
+            print(f"[Host] No se pudo cargar historial: {e}")
+
+        try:
+            self._host_wsserver = await websockets.serve(
+                self._host_handler, host=host, port=port,
+                ping_interval=20, ping_timeout=20, max_queue=32, close_timeout=5
+            )
+            self._host_running = True
+            print(f"[Host] Servidor WebSocket en ws://{host}:{port}")
+        except OSError as e:
+            print(f"[Host] No se pudo iniciar servidor en {port}: {e}")
+            self.settings.host_mode = False
+            self.settings.save()
+
+    async def _host_stop(self):
+        if not self._host_running:
+            return
+        try:
+            self._host_wsserver.close()
+            await self._host_wsserver.wait_closed()
+            print("[Host] Servidor detenido")
+        except Exception as e:
+            print(f"[Host] Error al detener servidor: {e}")
+        finally:
+            self._host_running = False
+            self._host_clients.clear()
+
+    async def _host_handler(self, ws):
+        self._host_clients.add(ws)
+        try:
+            # enviar historial a quien entra
+            if self._host_history:
+                payload = {"type": "history", "items": list(self._host_history)}
+                await self._host_safe_send(ws, json.dumps(payload, ensure_ascii=False))
+
+            async for raw in ws:
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+
+                text = msg.get("text", "")
+                sender = msg.get("from", "???")
+                attachments = msg.get("attachments", [])
+
+                norm = {
+                    "type": "image" if attachments else "msg",
+                    "from": sender,
+                    "text": text,
+                    "attachments": attachments,
+                    "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+                }
+
+                self._host_history.append(norm)
+                # persistir a disco
+                try:
+                    self._host_history_path.write_text(
+                        json.dumps(list(self._host_history), ensure_ascii=False, indent=2),
+                        encoding="utf-8"
+                    )
+                except Exception as e:
+                    print(f"[Host] No se pudo guardar historial: {e}")
+
+                # broadcast a todos excepto el emisor
+                await self._host_broadcast(norm, sender_ws=ws)
+        finally:
+            self._host_clients.discard(ws)
+
+    async def _host_broadcast(self, msg: dict, sender_ws=None):
+        if not self._host_clients:
+            return
+        data = json.dumps(msg, ensure_ascii=False)
+        dead = []
+        for c in list(self._host_clients):
+            if c is sender_ws:
+                continue
+            ok = await self._host_safe_send(c, data)
+            if not ok:
+                dead.append(c)
+        for d in dead:
+            try:
+                self._host_clients.discard(d)
+            except Exception:
+                pass
+
+    async def _host_safe_send(self, ws, data: str) -> bool:
+        try:
+            await ws.send(data)
+            return True
+        except Exception:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+            return False
+
+
+
         
 
     # ---------- Helpers de icono/no leídos ----------
@@ -608,7 +753,7 @@ class TrayClient(QtWidgets.QSystemTrayIcon):
 
     # ---------- Configuración ----------
     def open_settings(self):
-        if not prompt_password(self.settings.password):
+        if not prompt_password(self.settings.password, self.settings.admin_mode):
             QtWidgets.QMessageBox.warning(None, "Acceso denegado", "Clave incorrecta.")
             return
         
@@ -622,6 +767,12 @@ class TrayClient(QtWidgets.QSystemTrayIcon):
                                else self.icon_normal
             self._update_tray_icon()
             asyncio.run_coroutine_threadsafe(self._force_reconnect(), self.loop)
+            if self.settings.host_mode and not self.settings.server_url.startswith("ws://127.0.0.1"):
+                self.settings.server_url = "ws://127.0.0.1:8765"
+                self.settings.save()
+                asyncio.run_coroutine_threadsafe(self._force_reconnect(), self.loop)
+            else:
+                asyncio.run_coroutine_threadsafe(self._force_reconnect(), self.loop)
 
         dlg.saved.connect(apply_and_refresh)
         dlg.exec()
