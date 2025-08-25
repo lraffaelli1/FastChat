@@ -92,18 +92,20 @@ def _img_link_from_bytes(b: bytes, mime: str = "image/png", name: str = "imagen.
 class Settings:
     def __init__(self):
         self.qs = QtCore.QSettings(APP_ORG, APP_NAME)
-        # Defaults
-        self.server_url = self.qs.value("server_url", "ws://127.0.0.1:8765", str)
-        self.user_name  = self.qs.value("user_name",  "Usuario", str)
-        self.sound_path = self.qs.value("sound_path", resource_path("sound.wav"), str)
-        self.sound_send = self.qs.value("sound_send", resource_path("send.wav"), str)
-        self.sound_recive = self.qs.value("sound_recive", resource_path("recive.wav"), str)
-        self.icon_path  = self.qs.value("icon_path",  resource_path("icon.ico"), str)
-        self.icon_unread = self.qs.value("icon_unread", resource_path("icon_unread.ico"), str)
-        self.toast_ms   = int(self.qs.value("toast_ms", 5000))
-        self.password     = self.qs.value("password", "vna117sw.", str) 
-        self.host_mode     = self.qs.value("host_mode", False, bool)
-        self.admin_mode    = self.qs.value("admin_mode", False, bool)
+        self.server_url   = self.qs.value("server_url", "ws://127.0.0.1:8765", str)
+        self.user_name    = self.qs.value("user_name",  "Usuario", str)
+
+        # 👇 Guardamos tokens (basename) por default, no rutas absolutas
+        self.sound_path   = self._sanitize_setting_path(self.qs.value("sound_path", "sound.wav", str), "sound.wav")
+        self.sound_send   = self._sanitize_setting_path(self.qs.value("sound_send", "send.wav", str), "send.wav")
+        self.sound_recive = self._sanitize_setting_path(self.qs.value("sound_recive", "recive.wav", str), "recive.wav")
+        self.icon_path    = self._sanitize_setting_path(self.qs.value("icon_path", "icon.ico", str), "icon.ico")
+        self.icon_unread  = self._sanitize_setting_path(self.qs.value("icon_unread", "icon_unread.ico", str), "icon_unread.ico")
+
+        self.toast_ms     = int(self.qs.value("toast_ms", 5000))
+        self.password     = self.qs.value("password", "vna117sw.", str)
+        self.host_mode    = self.qs.value("host_mode", False, bool)
+        self.admin_mode   = self.qs.value("admin_mode", False, bool)
 
     def save(self):
         self.qs.setValue("server_url", self.server_url)
@@ -118,6 +120,43 @@ class Settings:
         self.qs.setValue("host_mode", self.host_mode)
         self.qs.setValue("admin_mode", self.admin_mode)
         self.qs.sync()
+
+    def _sanitize_setting_path(self, val: str, default_basename: str) -> str:
+        """Evita persistir rutas volátiles (p.ej. _MEIPASS). Si viene vacía o volátil, usa basename."""
+        if not val:
+            return default_basename
+        meipass = str(getattr(sys, "_MEIPASS", "")) or ""
+        # si el valor guardado apunta a una carpeta temporal de PyInstaller, lo “reseteamos” al basename
+        if meipass and str(val).startswith(meipass):
+            return default_basename
+        return val
+    
+def resolve_asset(value: str, fallback_basename: str) -> str:
+    """
+    - Si 'value' es una ruta absoluta existente → úsala.
+    - Si es token/basename (sin path) → resuélvelo vía resource_path().
+    - Si no existe → usa resource_path(fallback_basename).
+    """
+    if not value:
+        return resource_path(fallback_basename)
+    p = pathlib.Path(value)
+    if p.is_absolute():
+        return str(p) if p.exists() else resource_path(fallback_basename)
+    # es un basename/tipo token
+    candidate = resource_path(value)
+    return candidate if pathlib.Path(candidate).exists() else resource_path(fallback_basename)
+
+
+def safe_qicon(path_or_token: str, fallback_basename: str, app: QtWidgets.QApplication) -> QtGui.QIcon:
+    path = resolve_asset(path_or_token, fallback_basename)
+    if pathlib.Path(path).exists():
+        ico = QtGui.QIcon(path)
+        if not ico.isNull():
+            return ico
+    # fallback al ícono del sistema si falló todo
+    return app.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_ComputerIcon)
+
+
 
 def prompt_password(correct: str, admin_mode: bool = False) -> bool:
     if admin_mode:
@@ -501,10 +540,9 @@ class TrayClient(QtWidgets.QSystemTrayIcon):
         self.settings = settings
 
         # Cargamos ambos íconos y dejamos uno por defecto
-        self.icon_normal = QtGui.QIcon(self.settings.icon_path) if pathlib.Path(self.settings.icon_path).exists() \
-                           else app.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_ComputerIcon)
-        self.icon_unread = QtGui.QIcon(self.settings.icon_unread) if pathlib.Path(self.settings.icon_unread).exists() \
-                           else self.icon_normal
+        self.icon_normal = safe_qicon(self.settings.icon_path, "icon.ico", app)
+        self.icon_unread = safe_qicon(self.settings.icon_unread, "icon_unread.ico", app)
+
 
         self.unread_count = 0  # 👈 contador de no leídos
 
@@ -535,7 +573,6 @@ class TrayClient(QtWidgets.QSystemTrayIcon):
         # Hilo WebSocket
         self.ws_thread = threading.Thread(target=self._ws_thread_main, daemon=True)
         self.ws_thread.start()
-        self._host_running = False
         self._host_running = False
         self._host_clients = set()
         self._host_history = deque(maxlen=30)
@@ -690,12 +727,12 @@ class TrayClient(QtWidgets.QSystemTrayIcon):
 
         if self.reply_dialog and self.reply_dialog.isVisible():
             self.reply_dialog.set_history(self.last_msgs)
-            play_sound(self.settings.sound_recive, "recive.wav")
+            play_sound(resolve_asset(self.settings.sound_recive, "recive.wav"), "recive.wav")
             return
 
         self.unread_count += 1
         self._update_tray_icon()
-        play_sound(self.settings.sound_path, "sound.wav")
+        play_sound(resolve_asset(self.settings.sound_path, "sound.wav"), "sound.wav")
         self.showMessage("🗲 Nuevo Mensaje", f"{sender}: {text}", self.icon(), self.settings.toast_ms)
 
 
@@ -742,7 +779,7 @@ class TrayClient(QtWidgets.QSystemTrayIcon):
 
             self.last_msgs.append((self.settings.user_name, shown_html))
             dlg.set_history(self.last_msgs)
-            play_sound(self.settings.sound_send, "send.wav")
+            play_sound(resolve_asset(self.settings.sound_send, "send.wav"), "send.wav")
 
 
         dlg.submitted.connect(send_and_append)
@@ -761,10 +798,8 @@ class TrayClient(QtWidgets.QSystemTrayIcon):
 
         def apply_and_refresh(st: Settings):
             self.settings = st
-            self.icon_normal = QtGui.QIcon(self.settings.icon_path) if pathlib.Path(self.settings.icon_path).exists() \
-                               else self.icon_normal
-            self.icon_unread = QtGui.QIcon(self.settings.icon_unread) if pathlib.Path(self.settings.icon_unread).exists() \
-                               else self.icon_normal
+            self.icon_normal = safe_qicon(self.settings.icon_path, "icon.ico", self.app)
+            self.icon_unread = safe_qicon(self.settings.icon_unread, "icon_unread.ico", self.app)
             self._update_tray_icon()
             asyncio.run_coroutine_threadsafe(self._force_reconnect(), self.loop)
             if self.settings.host_mode and not self.settings.server_url.startswith("ws://127.0.0.1"):
